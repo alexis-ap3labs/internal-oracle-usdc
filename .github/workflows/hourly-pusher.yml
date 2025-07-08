@@ -1,0 +1,56 @@
+name: Push NAV for DeTrade Core USDC
+
+on:
+  # push:
+  #   branches:
+  #     - main
+  # schedule:
+  #   - cron: '0 * * * *'  # Runs every hour
+  workflow_dispatch:  # Allows manual triggering
+
+jobs:
+  run-pusher:
+    runs-on: ubuntu-latest
+    env:
+      ETHEREUM_RPC: ${{ secrets.ETHEREUM_RPC }}
+      BASE_RPC: ${{ secrets.BASE_RPC }}
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Debug - List directory structure
+      run: |
+        echo "Current directory structure:"
+        ls -la
+        echo "\nBuilder directory:"
+        ls -la builder/
+        
+    - name: Debug - Check environment variables
+      run: |
+        echo "Checking environment variables:"
+        echo "ETHEREUM_RPC exists: ${{ env.ETHEREUM_RPC != '' }}"
+        echo "BASE_RPC exists: ${{ env.BASE_RPC != '' }}"
+        echo "MONGO_URI exists: ${{ secrets.MONGO_URI != '' }}"
+        echo "DATABASE_NAME exists: ${{ secrets.DATABASE_NAME != '' }}"
+        echo "COLLECTION_NAME exists: ${{ secrets.COLLECTION_NAME != '' }}"
+        
+    - name: Run pusher
+      env:
+        MONGO_URI: ${{ secrets.MONGO_URI }}
+        DATABASE_NAME: ${{ secrets.DATABASE_NAME }}
+        COLLECTION_NAME: ${{ secrets.COLLECTION_NAME }}
+        PRODUCTION_ADDRESS: ${{ secrets.PRODUCTION_ADDRESS }}
+      run: |
+        echo "Running pusher with Python version:"
+        python --version
+        python -m builder.pusher 
