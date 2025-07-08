@@ -83,6 +83,23 @@ PENDLE_POOLS = {
                 "symbol": "fGHO"
             }
         ),
+        "PT-cUSDO-31JUL2025": PendlePool(
+            network="ethereum",
+            pt_address="0xb10da2f9147f9cf2b8826877cd0c95c18a0f42dc",  # PT token address
+            pt_symbol="PT-cUSDO-31JUL2025",
+            pt_name="PT Compounding Open Dollar 31JUL2025",
+            market_address="0x3F53eb4c57c7E7118BE8566bCd503EA502639581",
+            expiry_timestamp=1753920000,  # Same as fGHO (31 July 2025)
+            sy_address="0x20b59becded839835a3ba58629430375dae02720",  # Correct SY address
+            sy_symbol="SY-cUSDO",
+            sy_name="SY Compounding Open Dollar",
+            underlying_token={
+                "address": "0xaD55aebc9b8c03FC43cd9f62260391c13c23e7c0",
+                "decimals": 18,
+                "name": "Compounding Open Dollar",
+                "symbol": "cUSDO"
+            }
+        ),
         "PT-csUSDL-31JUL2025": PendlePool(
             network="ethereum",
             pt_address="0xf10A134A987E22ffa9463570A6D1eb92a63Fc178",

@@ -563,6 +563,86 @@ class BalanceManager:
                 else:
                     raise Exception("Both direct and fallback methods failed")
                 
+        elif underlying_token['symbol'] == 'cUSDO':
+            # Handle cUSDO token - direct conversion to USDC
+            print(f"Input: {Decimal(total_sy_amount)/Decimal(10**18)} {underlying_token['symbol']}")
+            
+            # Convert cUSDO directly to USDC
+            print(f"\nStep 4: Converting cUSDO to USDC via CoWSwap")
+            print(f"cUSDO Token: {underlying_token['address']}")
+            print(f"USDC Token: {USDC_ADDRESS}")
+            print(f"Amount: {total_sy_amount} wei")
+            
+            result = get_quote(
+                network=network,
+                sell_token=underlying_token['address'],
+                buy_token=USDC_ADDRESS,
+                amount=str(total_sy_amount),
+                token_decimals=underlying_token['decimals'],
+                token_symbol="cUSDO"
+            )
+            
+            if result["quote"]:
+                fallback_usdc_amount = int(result["quote"]["quote"]["buyAmount"])
+                fallback_price_impact = float(result["conversion_details"].get("price_impact", "0"))
+                if isinstance(fallback_price_impact, str) and fallback_price_impact == "N/A":
+                    fallback_price_impact = 0
+                    
+                print("\n✓ cUSDO -> USDC conversion successful")
+                print(f"Input: {Decimal(total_sy_amount)/Decimal(10**18)} cUSDO")
+                print(f"Output: {Decimal(fallback_usdc_amount)/Decimal(10**6)} USDC")
+                print(f"Price impact: {fallback_price_impact:.4f}%")
+                
+                # Compare with direct method
+                print("\n" + "="*80)
+                print("COMPARISON OF METHODS")
+                print("="*80)
+                
+                if direct_result and fallback_usdc_amount > 0:
+                    print("\nDirect Method:")
+                    print(f"Amount: {Decimal(direct_result['amount'])/Decimal(10**6)} USDC")
+                    print(f"Price Impact: {direct_result['price_impact']:.4f}%")
+                    
+                    print("\nFallback Method:")
+                    print(f"Amount: {Decimal(fallback_usdc_amount)/Decimal(10**6)} USDC")
+                    print(f"Price Impact: {fallback_price_impact:.4f}%")
+                    
+                    print("\nDifference:")
+                    diff_amount = abs(direct_result['amount'] - fallback_usdc_amount)
+                    diff_percentage = (diff_amount / direct_result['amount']) * 100
+                    print(f"Amount Difference: {Decimal(diff_amount)/Decimal(10**6)} USDC ({diff_percentage:.4f}%)")
+                    
+                    # Use the method with the higher amount
+                    if direct_result['amount'] >= fallback_usdc_amount:
+                        return direct_result['amount'], direct_result['price_impact'], "Direct", direct_result, {
+                            "amount": fallback_usdc_amount,
+                            "price_impact": fallback_price_impact,
+                            "method": "fallback"
+                        }
+                    else:
+                        return fallback_usdc_amount, fallback_price_impact, "Fallback", direct_result, {
+                            "amount": fallback_usdc_amount,
+                            "price_impact": fallback_price_impact,
+                            "method": "fallback"
+                        }
+                elif direct_result:
+                    return direct_result['amount'], direct_result['price_impact'], "Direct", direct_result, None
+                elif fallback_usdc_amount > 0:
+                    return fallback_usdc_amount, fallback_price_impact, "Fallback", None, {
+                        "amount": fallback_usdc_amount,
+                        "price_impact": fallback_price_impact,
+                        "method": "fallback"
+                    }
+                else:
+                    raise Exception("Both direct and fallback methods failed")
+            else:
+                print("\n✗ CoWSwap conversion failed")
+                print("Response:", json.dumps(result, indent=2))
+                if direct_result:
+                    return direct_result['amount'], direct_result['price_impact'], "Direct", direct_result, None
+                else:
+                    raise Exception("Both direct and fallback methods failed")
+                    
         elif underlying_token['symbol'] == 'yvBal-GHO-USR':
             # Handle yvBal token
             # Yearn V3 Vault ABI

@@ -67,6 +67,21 @@ EQUILIBRIA_POOLS = {
                     'decimals': 18
                 }
             }
+        ),
+        'cUSDO': EquilibriaPool(
+            network='ethereum',
+            market_address='0x3F53eb4c57c7E7118BE8566bCd503EA502639581',  # Market LP
+            reward_pool_address='0x750373C964105624a2D20C0B2F1f89468158158B',  # Reward
+            booster_address='0x4D32C8Ff2fACC771eC7Efc70d6A8468bC30C26bF',  # Deposit
+            decimals=18,
+            pendle_pt_symbol='PT-cUSDO-31JUL2025',
+            underlying={
+                'cUSDO': {
+                    'address': '0xaD55aebc9b8c03FC43cd9f62260391c13c23e7c0',
+                    'symbol': 'cUSDO',
+                    'decimals': 18
+                }
+            }
         )
     },
     'base': {
