@@ -9,12 +9,12 @@ from decimal import Decimal
 import requests
 import time
 from datetime import datetime
-from utils.retry import Web3Retry, APIRetry
 
 """
 Pendle balance manager module.
 Handles balance fetching and USDC valuation for Pendle Principal Tokens (PT).
 Integrates with Pendle's API for accurate price discovery and fallback mechanisms.
+Now supports multiple aggregators (kyberswap, odos, paraswap) with rate limiting.
 """
 
 # Add parent directory to PYTHONPATH
@@ -24,7 +24,9 @@ sys.path.append(root_path)
 # Load environment variables from parent directory
 load_dotenv(Path(root_path) / '.env')
 
-from config.networks import RPC_URLS, CHAIN_IDS
+# Import project modules after adding to path
+from utils.retry import Web3Retry, APIRetry
+from config.networks import RPC_URLS, CHAIN_IDS, NETWORK_TOKENS
 from cowswap.cow_client import get_quote
 from pendle.pool import get_all_pools, get_pool_info
 
@@ -42,6 +44,21 @@ USDC_TOKENS = {
         "name": "USD Coin",
         "symbol": "USDC"
     }
+}
+
+# Aggregator configuration with computing unit costs
+AGGREGATORS = {
+    "kyberswap": {"cost": 5, "name": "kyberswap"},
+    "odos": {"cost": 15, "name": "odos"},
+    "paraswap": {"cost": 15, "name": "paraswap"}
+}
+
+# Rate limiting configuration
+RATE_LIMIT_CONFIG = {
+    "max_units_per_minute": 100,
+    "total_cost_per_quote": sum(agg["cost"] for agg in AGGREGATORS.values()),  # 35 units
+    "delay_between_aggregators": 2,  # seconds between each aggregator call
+    "delay_between_quotes": 20  # seconds between quote batches (35 units every 20s = ~105 units/min, so we stay under 100)
 }
 
 # Replace PT_ABI with minimal ABI
@@ -152,14 +169,15 @@ class PendleBalanceManager:
     Unified manager for Pendle positions handling:
     - Smart contract interactions
     - Balance fetching
-    - Price discovery
-    - USDC conversion
+    - Price discovery with multiple aggregators
+    - USDC conversion with rate limiting
     """
     
     API_CONFIG = {
         "base_url": "https://api-v2.pendle.finance/core/v1/sdk",
         "default_slippage": "0.01",  # Changed to decimal percentage (0.01 = 1%)
-        "enable_aggregator": "true"
+        "enable_aggregator": "true",
+        "aggregators": "kyberswap,odos,paraswap"  # Comma-separated list
     }
     
     MAX_PRICE_IMPACT = 0.05  # 5%
@@ -186,6 +204,11 @@ class PendleBalanceManager:
         
         # Initialize current timestamp
         self.current_timestamp = int(datetime.now().timestamp())
+        
+        # Rate limiting tracking
+        self.last_quote_time = 0
+        self.computing_units_used = 0
+        self.minute_start_time = time.time()
 
     def _init_contracts(self) -> Dict:
         """Initialize Web3 contract instances for all Pendle PT tokens"""
@@ -287,9 +310,171 @@ class PendleBalanceManager:
             print(f"Error getting Pendle LP balances: {e}")
             return {}
 
+    def _manage_rate_limit(self):
+        """
+        Manage rate limiting for computing units.
+        Ensures we don't exceed 100 units per minute.
+        """
+        current_time = time.time()
+        
+        # Reset counter if a minute has passed
+        if current_time - self.minute_start_time >= 60:
+            self.computing_units_used = 0
+            self.minute_start_time = current_time
+            print("\n[Rate Limit] Reset: New minute started")
+        
+        # Check if we need to wait before next quote batch
+        total_cost = RATE_LIMIT_CONFIG["total_cost_per_quote"]
+        if self.computing_units_used + total_cost > RATE_LIMIT_CONFIG["max_units_per_minute"]:
+            wait_time = 60 - (current_time - self.minute_start_time)
+            if wait_time > 0:
+                print(f"\n[Rate Limit] Waiting {wait_time:.1f}s (used {self.computing_units_used}/{RATE_LIMIT_CONFIG['max_units_per_minute']} units)")
+                time.sleep(wait_time)
+                self.computing_units_used = 0
+                self.minute_start_time = time.time()
+        
+        # Add delay between quote batches
+        if self.last_quote_time > 0:
+            time_since_last = current_time - self.last_quote_time
+            min_delay = RATE_LIMIT_CONFIG["delay_between_quotes"]
+            if time_since_last < min_delay:
+                wait_time = min_delay - time_since_last
+                print(f"\n[Rate Limit] Quote spacing: waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+
+    def _get_multiple_aggregator_quotes(self, url: str, base_params: dict) -> Tuple[int, float, Dict]:
+        """
+        Get quotes from multiple aggregators and return the best one.
+        
+        Args:
+            url: Pendle API endpoint URL
+            base_params: Base parameters for the request
+            
+        Returns:
+            Tuple containing best USDC amount, price impact, and conversion details
+        """
+        print(f"\n[Multi-Aggregator] Testing {len(AGGREGATORS)} aggregators...")
+        
+        self._manage_rate_limit()
+        
+        best_result = None
+        best_usdc_amount = 0
+        best_price_impact = float('inf')
+        aggregator_results = {}
+        
+        for i, (agg_name, agg_config) in enumerate(AGGREGATORS.items()):
+            try:
+                print(f"\n[{i+1}/{len(AGGREGATORS)}] Testing {agg_name} (cost: {agg_config['cost']} units)")
+                
+                # Prepare params with specific aggregator
+                params = base_params.copy()
+                params["aggregators"] = agg_name
+                
+                print(f"Request parameters for {agg_name}:")
+                print(json.dumps(params, indent=2))
+                
+                # Make request
+                print(f"Sending request to {agg_name}...")
+                response = APIRetry.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Track computing units used
+                self.computing_units_used += agg_config["cost"]
+                print(f"[Rate Limit] Used {agg_config['cost']} units for {agg_name} (total: {self.computing_units_used}/100)")
+                
+                if 'data' in data and 'amountOut' in data['data']:
+                    usdc_amount = int(data['data']['amountOut'])
+                    price_impact = float(data['data'].get('priceImpact', 0))
+                    
+                    # Calculate rate for comparison
+                    amount_decimal = Decimal(base_params['amountIn']) / Decimal(10**18)
+                    usdc_decimal = Decimal(usdc_amount) / Decimal(10**6)
+                    rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
+                    
+                    aggregator_results[agg_name] = {
+                        "usdc_amount": usdc_amount,
+                        "price_impact": price_impact,
+                        "rate": float(rate),
+                        "success": True
+                    }
+                    
+                    print(f"✓ {agg_name} successful:")
+                    print(f"  - USDC amount: {usdc_decimal}")
+                    print(f"  - Rate: {float(rate):.6f} USDC/token")
+                    print(f"  - Price impact: {price_impact:.4f}%")
+                    
+                    # Check if this is the best result (highest USDC amount)
+                    if usdc_amount > best_usdc_amount:
+                        best_usdc_amount = usdc_amount
+                        best_price_impact = price_impact
+                        best_result = {
+                            "source": f"Pendle SDK ({agg_name})",
+                            "price_impact": f"{price_impact:.6f}",
+                            "rate": f"{rate:.6f}",
+                            "fee_percentage": "0.0000%",
+                            "fallback": False,
+                            "aggregator": agg_name,
+                            "note": f"Best result from {agg_name} aggregator"
+                        }
+                    
+                else:
+                    print(f"✗ {agg_name} invalid response: {data}")
+                    aggregator_results[agg_name] = {
+                        "error": "Invalid response format",
+                        "success": False
+                    }
+                
+            except Exception as e:
+                print(f"✗ {agg_name} failed: {str(e)}")
+                aggregator_results[agg_name] = {
+                    "error": str(e),
+                    "success": False
+                }
+                
+                # Still track computing units even on failure
+                self.computing_units_used += agg_config["cost"]
+            
+            # Add delay between aggregator calls (except for the last one)
+            if i < len(AGGREGATORS) - 1:
+                delay = RATE_LIMIT_CONFIG["delay_between_aggregators"]
+                print(f"[Rate Limit] Waiting {delay}s before next aggregator...")
+                time.sleep(delay)
+        
+        # Update last quote time
+        self.last_quote_time = time.time()
+        
+        # Display comparison results
+        print(f"\n[Multi-Aggregator] Comparison Results:")
+        print("-" * 50)
+        successful_results = [(name, result) for name, result in aggregator_results.items() if result.get("success")]
+        
+        if successful_results:
+            # Sort by USDC amount (best first)
+            successful_results.sort(key=lambda x: x[1]["usdc_amount"], reverse=True)
+            
+            for i, (name, result) in enumerate(successful_results):
+                symbol = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "  "
+                usdc_amount = result["usdc_amount"]
+                rate = result["rate"]
+                price_impact = result["price_impact"]
+                print(f"{symbol} {name}: {usdc_amount/1e6:.6f} USDC (rate: {rate:.6f}, impact: {price_impact:.4f}%)")
+        
+        failed_results = [(name, result) for name, result in aggregator_results.items() if not result.get("success")]
+        if failed_results:
+            print("\nFailed aggregators:")
+            for name, result in failed_results:
+                print(f"❌ {name}: {result.get('error', 'Unknown error')}")
+        
+        if best_result:
+            print(f"\n🏆 Best result: {best_result['aggregator']} with {best_usdc_amount/1e6:.6f} USDC")
+            return best_usdc_amount, best_price_impact, best_result
+        else:
+            raise Exception("All aggregators failed to provide quotes")
+
     def _get_usdc_quote(self, network: str, token_symbol: str, amount_in_wei: str, user_address: str) -> Tuple[int, float, Dict]:
         """
-        Get USDC conversion quote from Pendle SDK API.
+        Get USDC conversion quote from Pendle SDK API using multiple aggregators.
         
         Args:
             network: Network identifier (ethereum/base)
@@ -303,7 +488,7 @@ class PendleBalanceManager:
             - Price impact percentage
             - Conversion details
         """
-        print(f"\nAttempting to get quote for {token_symbol}:")
+        print(f"\n[Quote] Getting multi-aggregator quote for {token_symbol}")
         
         try:
             token_data = get_pool_info(network, token_symbol)[token_symbol]
@@ -339,8 +524,8 @@ class PendleBalanceManager:
                 
                 raise Exception(f"Failed to convert {underlying_token['symbol']} to USDC")
 
-            # If not expired, use Pendle API
-            print(f"\nRequesting Pendle API quote...")
+            # If not expired, use Pendle API with multiple aggregators
+            print(f"\nRequesting Pendle API quotes with multiple aggregators...")
             
             # Define URL first
             url = f"{self.API_CONFIG['base_url']}/{CHAIN_IDS[network]}/markets/{token_data['market']}/swap"
@@ -349,199 +534,142 @@ class PendleBalanceManager:
             # Use the test address as txOrigin since it will be the one executing the transaction
             tx_origin = Web3.to_checksum_address(user_address)
             print(f"\nUsing address as txOrigin and receiver: {tx_origin}")
-            print("Note: Both txOrigin and receiver must match the address that will execute the transaction")
             
-            params = {
-                "receiver": tx_origin,  # Use same address as txOrigin
+            base_params = {
+                "receiver": tx_origin,
                 "slippage": self.API_CONFIG["default_slippage"],
                 "enableAggregator": self.API_CONFIG["enable_aggregator"],
                 "tokenIn": token_data["address"],
                 "tokenOut": USDC_TOKENS[network]["address"],
                 "amountIn": amount_in_wei,
                 "txOrigin": tx_origin
+                # Note: aggregators parameter will be set per aggregator in _get_multiple_aggregator_quotes
             }
             
-            print("\nInitial request parameters:")
-            print(json.dumps(params, indent=2))
-            
             try:
-                print("\nSending request to Pendle API...")
-                response = APIRetry.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
+                return self._get_multiple_aggregator_quotes(url, base_params)
+                
             except Exception as e:
-                print("\n✗ Initial request failed")
-                print(f"Error type: {type(e).__name__}")
-                print(f"Error message: {str(e)}")
+                print(f"\n✗ All aggregators failed: {str(e)}")
                 
-                # Try to get more details from the response if available
-                if hasattr(e, 'response') and e.response is not None:
-                    print(f"\nResponse status: {e.response.status_code}")
-                    print(f"Response headers: {json.dumps(dict(e.response.headers), indent=2)}")
-                    try:
-                        error_details = e.response.json()
-                        print("\nAPI Error details:")
-                        print(json.dumps(error_details, indent=2))
-                    except:
-                        print(f"Raw response: {e.response.text}")
+                # Fallback to original logic with single aggregator
+                print("\n" + "="*80)
+                print("FALLBACK MODE ACTIVATED")
+                print("="*80)
+                print("Attempting fallback strategy: PT -> SY -> Underlying -> USDC")
                 
-                if "400" in str(e) and "txOrigin" in str(e):
-                    print("\nDetected txOrigin error - This usually means:")
-                    print("1. The txOrigin address is not properly formatted")
-                    print("2. The txOrigin address is not allowed by the API")
-                    print("3. The txOrigin address is not a valid Ethereum address")
-                    print(f"\nCurrent txOrigin: {tx_origin}")
-                    print("Note: This address should be the one that will execute the transaction")
-                    
-                    print("\n" + "="*80)
-                    print("FALLBACK MODE ACTIVATED")
-                    print("="*80)
-                    print(f"Error: {str(e)}")
-                    print("\nAttempting fallback strategy: PT -> SY -> Underlying -> USDC")
-                    
-                    # Fallback: Try without aggregator and use SY token
-                    if "sy_token" not in token_data:
-                        print("✗ No SY token configured for fallback")
-                        raise Exception("No SY token configured for fallback")
-                    
-                    print("\nStep 1: Converting PT to SY")
-                    print(f"PT Token: {token_data['address']}")
-                    print(f"SY Token: {token_data['sy_token']['address']}")
-                    print(f"Amount: {amount_in_wei} wei")
-                    
-                    # First convert PT to SY
-                    sy_params = {
-                        "receiver": tx_origin,  # Use same address as txOrigin
-                        "slippage": self.API_CONFIG["default_slippage"],
-                        "enableAggregator": "false",
-                        "tokenIn": token_data["address"],
-                        "tokenOut": token_data["sy_token"]["address"],
-                        "amountIn": amount_in_wei,
-                        "txOrigin": tx_origin
-                    }
-                    
-                    print("\nPT -> SY Request parameters:")
-                    print(json.dumps(sy_params, indent=2))
-                    
-                    try:
-                        print("\nSending PT -> SY request...")
-                        sy_response = APIRetry.get(url, params=sy_params)
-                        sy_response.raise_for_status()
-                        sy_data = sy_response.json()
-                        
-                        if 'data' in sy_data and 'amountOut' in sy_data['data']:
-                            sy_amount = sy_data['data']['amountOut']
-                            print(f"\n✓ PT -> SY conversion successful")
-                            print(f"Input: {Decimal(amount_in_wei)/Decimal(10**18)} PT")
-                            print(f"Output: {Decimal(sy_amount)/Decimal(10**18)} SY")
-                            
-                            # Since 1 SY = 1 underlying, we can use the SY amount directly
-                            underlying_token = next(iter(token_data['underlying'].values()))
-                            print(f"\nStep 2: Converting {underlying_token['symbol']} to USDC via CoWSwap")
-                            print(f"Underlying Token: {underlying_token['address']}")
-                            print(f"USDC Token: {USDC_TOKENS[network]['address']}")
-                            print(f"Amount: {sy_amount} wei")
-                            
-                            result = get_quote(
-                                network=network,
-                                sell_token=underlying_token['address'],
-                                buy_token=USDC_TOKENS[network]['address'],
-                                amount=sy_amount,
-                                token_decimals=underlying_token['decimals'],
-                                token_symbol=underlying_token['symbol']
-                            )
-                            
-                            if result["quote"]:
-                                usdc_amount = int(result["quote"]["quote"]["buyAmount"])
-                                price_impact = float(result["conversion_details"].get("price_impact", "0"))
-                                if isinstance(price_impact, str) and price_impact == "N/A":
-                                    price_impact = 0
-                                    
-                                # Calculate rate for monitoring
-                                amount_decimal = Decimal(amount_in_wei) / Decimal(10**18)
-                                usdc_decimal = Decimal(usdc_amount) / Decimal(10**6)
-                                rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
-                                
-                                print("\n✓ Fallback conversion complete")
-                                print("Conversion path:")
-                                print(f"1. PT: {amount_decimal} {token_symbol}")
-                                print(f"2. SY: {Decimal(sy_amount)/Decimal(10**18)} SY")
-                                print(f"3. USDC: {usdc_decimal} USDC")
-                                print("\nFinal metrics:")
-                                print(f"- Rate: {float(rate):.6f} USDC/{token_symbol}")
-                                print(f"- Price impact: {price_impact:.4f}%")
-                                print(f"- Source: Pendle SDK + CoWSwap")
-                                
-                                conversion_details = {
-                                    "source": "Pendle SDK + CoWSwap",
-                                    "price_impact": f"{price_impact:.6f}",
-                                    "rate": f"{rate:.6f}",
-                                    "fee_percentage": result["conversion_details"].get("fee_percentage", "0.0000%"),
-                                    "fallback": True,
-                                    "note": "PT -> SY (1:1) -> Underlying -> USDC via CoWSwap"
-                                }
-                                
-                                return usdc_amount, price_impact, conversion_details
-                            else:
-                                print("\n✗ CoWSwap conversion failed")
-                                print("Response:", json.dumps(result, indent=2))
-                                raise Exception(f"Failed to convert {underlying_token['symbol']} to USDC via CoWSwap")
-                        else:
-                            print("\n✗ Invalid response from PT to SY conversion")
-                            print("Response:", json.dumps(sy_data, indent=2))
-                            raise Exception("Invalid response from PT to SY conversion")
-                            
-                    except Exception as fallback_error:
-                        print("\n✗ Fallback process failed")
-                        print(f"Error details: {str(fallback_error)}")
-                        print("\nFull error chain:")
-                        print(f"1. Original error: {str(e)}")
-                        print(f"2. Fallback error: {str(fallback_error)}")
-                        
-                        # Try to get more details from the fallback error response
-                        if hasattr(fallback_error, 'response') and fallback_error.response is not None:
-                            print(f"\nFallback response status: {fallback_error.response.status_code}")
-                            print(f"Fallback response headers: {json.dumps(dict(fallback_error.response.headers), indent=2)}")
-                            try:
-                                fallback_error_details = fallback_error.response.json()
-                                print("\nFallback API Error details:")
-                                print(json.dumps(fallback_error_details, indent=2))
-                            except:
-                                print(f"Raw fallback response: {fallback_error.response.text}")
-                        
-                        raise Exception(f"Both direct and fallback conversions failed: {str(e)} -> {str(fallback_error)}")
-                else:
-                    raise e
-            
-            if 'data' in data and 'amountOut' in data['data']:
-                usdc_amount = int(data['data']['amountOut'])
-                price_impact = float(data['data'].get('priceImpact', 0))
+                # Try without aggregator and use SY token
+                if "sy_token" not in token_data:
+                    print("✗ No SY token configured for fallback")
+                    raise Exception("No SY token configured for fallback")
                 
-                # Calculate rate for monitoring
-                amount_decimal = Decimal(amount_in_wei) / Decimal(10**18)
-                usdc_decimal = Decimal(usdc_amount) / Decimal(10**6)
-                rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
+                print("\nStep 1: Converting PT to SY")
+                print(f"PT Token: {token_data['address']}")
+                print(f"SY Token: {token_data['sy_token']['address']}")
+                print(f"Amount: {amount_in_wei} wei")
                 
-                print(f"✓ Quote successful:")
-                print(f"  - Sell amount: {amount_decimal} {token_symbol}")
-                print(f"  - Buy amount: {usdc_decimal} USDC")
-                print(f"  - Rate: {float(rate):.6f} USDC/{token_symbol}")
-                print(f"  - Price impact: {price_impact:.4f}%")
-                
-                conversion_details = {
-                    "source": "Pendle SDK",
-                    "price_impact": f"{price_impact:.6f}",
-                    "rate": f"{rate:.6f}",
-                    "fee_percentage": "0.0000%",
-                    "fallback": False,
-                    "note": "Direct Conversion using Pendle SDK"
+                # First convert PT to SY
+                sy_params = {
+                    "receiver": tx_origin,  # Use same address as txOrigin
+                    "slippage": self.API_CONFIG["default_slippage"],
+                    "enableAggregator": "false",
+                    "tokenIn": token_data["address"],
+                    "tokenOut": token_data["sy_token"]["address"],
+                    "amountIn": amount_in_wei,
+                    "txOrigin": tx_origin
                 }
                 
-                return usdc_amount, price_impact, conversion_details
-            
-            print(f"✗ Invalid response from Pendle API: {data}")
-            raise Exception("Invalid API response format")
+                print("\nPT -> SY Request parameters:")
+                print(json.dumps(sy_params, indent=2))
                 
+                try:
+                    print("\nSending PT -> SY request...")
+                    sy_response = APIRetry.get(url, params=sy_params)
+                    sy_response.raise_for_status()
+                    sy_data = sy_response.json()
+                    
+                    if 'data' in sy_data and 'amountOut' in sy_data['data']:
+                        sy_amount = sy_data['data']['amountOut']
+                        print(f"\n✓ PT -> SY conversion successful")
+                        print(f"Input: {Decimal(amount_in_wei)/Decimal(10**18)} PT")
+                        print(f"Output: {Decimal(sy_amount)/Decimal(10**18)} SY")
+                        
+                        # Since 1 SY = 1 underlying, we can use the SY amount directly
+                        underlying_token = next(iter(token_data['underlying'].values()))
+                        print(f"\nStep 2: Converting {underlying_token['symbol']} to USDC via CoWSwap")
+                        print(f"Underlying Token: {underlying_token['address']}")
+                        print(f"USDC Token: {USDC_TOKENS[network]['address']}")
+                        print(f"Amount: {sy_amount} wei")
+                        
+                        result = get_quote(
+                            network=network,
+                            sell_token=underlying_token['address'],
+                            buy_token=USDC_TOKENS[network]['address'],
+                            amount=sy_amount,
+                            token_decimals=underlying_token['decimals'],
+                            token_symbol=underlying_token['symbol']
+                        )
+                        
+                        if result["quote"]:
+                            usdc_amount = int(result["quote"]["quote"]["buyAmount"])
+                            price_impact = float(result["conversion_details"].get("price_impact", "0"))
+                            if isinstance(price_impact, str) and price_impact == "N/A":
+                                price_impact = 0
+                                
+                            # Calculate rate for monitoring
+                            amount_decimal = Decimal(amount_in_wei) / Decimal(10**18)
+                            usdc_decimal = Decimal(usdc_amount) / Decimal(10**6)
+                            rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
+                            
+                            print("\n✓ Fallback conversion complete")
+                            print("Conversion path:")
+                            print(f"1. PT: {amount_decimal} {token_symbol}")
+                            print(f"2. SY: {Decimal(sy_amount)/Decimal(10**18)} SY")
+                            print(f"3. USDC: {usdc_decimal} USDC")
+                            print("\nFinal metrics:")
+                            print(f"- Rate: {float(rate):.6f} USDC/{token_symbol}")
+                            print(f"- Price impact: {price_impact:.4f}%")
+                            print(f"- Source: Pendle SDK + CoWSwap")
+                            
+                            conversion_details = {
+                                "source": "Pendle SDK + CoWSwap",
+                                "price_impact": f"{price_impact:.6f}",
+                                "rate": f"{rate:.6f}",
+                                "fee_percentage": result["conversion_details"].get("fee_percentage", "0.0000%"),
+                                "fallback": True,
+                                "note": "PT -> SY (1:1) -> Underlying -> USDC via CoWSwap"
+                            }
+                            
+                            return usdc_amount, price_impact, conversion_details
+                        else:
+                            print("\n✗ CoWSwap conversion failed")
+                            print("Response:", json.dumps(result, indent=2))
+                            raise Exception(f"Failed to convert {underlying_token['symbol']} to USDC via CoWSwap")
+                    else:
+                        print("\n✗ Invalid response from PT to SY conversion")
+                        print("Response:", json.dumps(sy_data, indent=2))
+                        raise Exception("Invalid response from PT to SY conversion")
+                        
+                except Exception as fallback_error:
+                    print("\n✗ Fallback process failed")
+                    print(f"Error details: {str(fallback_error)}")
+                    print("\nFull error chain:")
+                    print(f"1. Original error: {str(e)}")
+                    print(f"2. Fallback error: {str(fallback_error)}")
+                    
+                    # Try to get more details from the fallback error response
+                    if hasattr(fallback_error, 'response') and fallback_error.response is not None:
+                        print(f"\nFallback response status: {fallback_error.response.status_code}")
+                        print(f"Fallback response headers: {json.dumps(dict(fallback_error.response.headers), indent=2)}")
+                        try:
+                            fallback_error_details = fallback_error.response.json()
+                            print("\nFallback API Error details:")
+                            print(json.dumps(fallback_error_details, indent=2))
+                        except:
+                            print(f"Raw fallback response: {fallback_error.response.text}")
+                    
+                    raise Exception(f"Both direct and fallback conversions failed: {str(e)} -> {str(fallback_error)}")
+            
         except Exception as e:
             print(f"✗ Technical error:")
             print(f"  {str(e)}")
@@ -549,7 +677,7 @@ class PendleBalanceManager:
 
     def _get_lp_usdc_quote(self, network: str, token_symbol: str, amount_in_wei: str, user_address: str) -> Tuple[int, float, Dict]:
         """
-        Get USDC conversion quote for LP tokens using Pendle's remove-liquidity endpoint.
+        Get USDC conversion quote for LP tokens using Pendle's remove-liquidity endpoint with multiple aggregators.
         
         Args:
             network: Network identifier (ethereum/base)
@@ -563,7 +691,7 @@ class PendleBalanceManager:
             - Price impact percentage
             - Conversion details
         """
-        print(f"\nAttempting to get remove-liquidity quote for {token_symbol}:")
+        print(f"\n[LP Quote] Getting multi-aggregator remove-liquidity quote for {token_symbol}")
         
         try:
             token_data = get_pool_info(network, token_symbol)[token_symbol]
@@ -576,34 +704,27 @@ class PendleBalanceManager:
             tx_origin = Web3.to_checksum_address(user_address)
             print(f"\nUsing address as txOrigin and receiver: {tx_origin}")
             
-            params = {
+            base_params = {
                 "receiver": tx_origin,
                 "slippage": self.API_CONFIG["default_slippage"],
                 "enableAggregator": self.API_CONFIG["enable_aggregator"],
                 "amountIn": amount_in_wei,
                 "tokenOut": USDC_TOKENS[network]["address"],
                 "txOrigin": tx_origin
+                # Note: aggregators parameter will be set per aggregator in _get_multiple_aggregator_quotes
             }
             
-            print("\nRequest parameters:")
-            print(json.dumps(params, indent=2))
-            
             try:
-                print("\nSending request to Pendle API...")
-                response = APIRetry.get(url, params=params)
-                response.raise_for_status()
-                data = response.json()
-            except Exception as e:
-                print("\n✗ Initial request failed")
-                print(f"Error type: {type(e).__name__}")
-                print(f"Error message: {str(e)}")
+                return self._get_multiple_aggregator_quotes(url, base_params)
                 
-                # Try fallback strategy: LP -> PT/SY -> USDC
+            except Exception as e:
+                print(f"\n✗ All aggregators failed for LP: {str(e)}")
+                
+                # Fallback to manual LP calculation
                 print("\n" + "="*80)
-                print("FALLBACK MODE ACTIVATED")
+                print("LP FALLBACK MODE ACTIVATED")
                 print("="*80)
-                print(f"Error: {str(e)}")
-                print("\nAttempting fallback strategy: LP -> PT/SY -> USDC")
+                print("Attempting fallback strategy: LP -> PT/SY -> USDC")
                 
                 # Get market contract to calculate exact SY/PT ratio
                 w3 = self.eth_w3 if network == 'ethereum' else self.base_w3
@@ -758,40 +879,11 @@ class PendleBalanceManager:
                     print("\n✗ Fallback process failed")
                     print(f"Error details: {str(fallback_error)}")
                     raise Exception(f"Both direct and fallback conversions failed: {str(e)} -> {str(fallback_error)}")
-            
-            if 'data' in data and 'amountOut' in data['data']:
-                usdc_amount = int(data['data']['amountOut'])
-                price_impact = float(data['data'].get('priceImpact', 0))
-                
-                # Calculate rate for monitoring
-                amount_decimal = Decimal(amount_in_wei) / Decimal(10**18)
-                usdc_decimal = Decimal(usdc_amount) / Decimal(10**6)
-                rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
-                
-                print(f"✓ Quote successful:")
-                print(f"  - Sell amount: {amount_decimal} LP")
-                print(f"  - Buy amount: {usdc_decimal} USDC")
-                print(f"  - Rate: {float(rate):.6f} USDC/LP")
-                print(f"  - Price impact: {price_impact:.4f}%")
-                
-                conversion_details = {
-                    "source": "Pendle SDK",
-                    "price_impact": f"{price_impact:.6f}",
-                    "rate": f"{rate:.6f}",
-                    "fee_percentage": "0.0000%",
-                    "fallback": False,
-                    "note": "Direct Conversion using Pendle SDK remove-liquidity"
-                }
-                
-                return usdc_amount, price_impact, conversion_details
-            
-            print(f"✗ Invalid response from Pendle API: {data}")
-            raise Exception("Invalid API response format")
                 
         except Exception as e:
             print(f"✗ Technical error:")
             print(f"  {str(e)}")
-            raise Exception(f"Failed to get Pendle quote: {str(e)}")
+            raise Exception(f"Failed to get Pendle LP quote: {str(e)}")
 
     def _get_rewards(self, network: str, market_address: str, user_address: str) -> Dict[str, Any]:
         """
@@ -921,12 +1013,13 @@ class PendleBalanceManager:
         Get token symbol from address using NETWORK_TOKENS
         """
         # First check USDC tokens
-        for symbol, token_info in USDC_TOKENS[network].items():
-            if token_info['address'].lower() == token_address.lower():
-                return symbol
+        usdc_info = USDC_TOKENS.get(network, {})
+        if usdc_info.get('address', '').lower() == token_address.lower():
+            return usdc_info.get('symbol', 'USDC')
                 
         # Then check all network tokens
-        for symbol, token_info in NETWORK_TOKENS[network].items():
+        network_tokens = NETWORK_TOKENS.get(network, {})
+        for symbol, token_info in network_tokens.items():
             if token_info['address'].lower() == token_address.lower():
                 return symbol
                 

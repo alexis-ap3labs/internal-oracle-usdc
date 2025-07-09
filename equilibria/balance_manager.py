@@ -40,6 +40,21 @@ USDC_ADDRESS = NETWORK_TOKENS['ethereum']['USDC']['address']
 # Pendle API base URL (without chain ID)
 PENDLE_API_BASE_URL = "https://api-v2.pendle.finance/core/v1/sdk"
 
+# Aggregator configuration with computing unit costs (same as pendle)
+AGGREGATORS = {
+    "kyberswap": {"cost": 5, "name": "kyberswap"},
+    "odos": {"cost": 15, "name": "odos"},
+    "paraswap": {"cost": 15, "name": "paraswap"}
+}
+
+# Rate limiting configuration (same as pendle)
+RATE_LIMIT_CONFIG = {
+    "max_units_per_minute": 100,
+    "total_cost_per_quote": sum(agg["cost"] for agg in AGGREGATORS.values()),  # 35 units
+    "delay_between_aggregators": 2,  # seconds between each aggregator call
+    "delay_between_quotes": 20  # seconds between quote batches
+}
+
 # BaseRewardPoolV2 ABI
 BASE_REWARD_POOL_ABI = [
     {
@@ -189,6 +204,173 @@ class BalanceManager:
                         print(f"Reward tokens: {reward_tokens}")
 
         self.current_timestamp = int(datetime.now().timestamp())
+        
+        # Rate limiting tracking
+        self.last_quote_time = 0
+        self.computing_units_used = 0
+        self.minute_start_time = time.time()
+
+    def _manage_rate_limit(self):
+        """
+        Manage rate limiting for computing units.
+        Ensures we don't exceed 100 units per minute.
+        """
+        current_time = time.time()
+        
+        # Reset counter if a minute has passed
+        if current_time - self.minute_start_time >= 60:
+            self.computing_units_used = 0
+            self.minute_start_time = current_time
+            print("\n[Rate Limit] Reset: New minute started")
+        
+        # Check if we need to wait before next quote batch
+        total_cost = RATE_LIMIT_CONFIG["total_cost_per_quote"]
+        if self.computing_units_used + total_cost > RATE_LIMIT_CONFIG["max_units_per_minute"]:
+            wait_time = 60 - (current_time - self.minute_start_time)
+            if wait_time > 0:
+                print(f"\n[Rate Limit] Waiting {wait_time:.1f}s (used {self.computing_units_used}/{RATE_LIMIT_CONFIG['max_units_per_minute']} units)")
+                time.sleep(wait_time)
+                self.computing_units_used = 0
+                self.minute_start_time = time.time()
+        
+        # Add delay between quote batches
+        if self.last_quote_time > 0:
+            time_since_last = current_time - self.last_quote_time
+            min_delay = RATE_LIMIT_CONFIG["delay_between_quotes"]
+            if time_since_last < min_delay:
+                wait_time = min_delay - time_since_last
+                print(f"\n[Rate Limit] Quote spacing: waiting {wait_time:.1f}s")
+                time.sleep(wait_time)
+
+    def _get_multiple_aggregator_quotes(self, url: str, base_params: dict) -> tuple:
+        """
+        Get quotes from multiple aggregators and return the best one.
+        
+        Args:
+            url: Pendle API endpoint URL
+            base_params: Base parameters for the request
+            
+        Returns:
+            Tuple containing best result info: (amount_out, price_impact, method_used, best_result_details)
+        """
+        print(f"\n[Multi-Aggregator] Testing {len(AGGREGATORS)} aggregators for remove-liquidity...")
+        
+        self._manage_rate_limit()
+        
+        best_result = None
+        best_amount = 0
+        best_price_impact = float('inf')
+        aggregator_results = {}
+        
+        headers = {"accept": "application/json"}
+        
+        for i, (agg_name, agg_config) in enumerate(AGGREGATORS.items()):
+            try:
+                print(f"\n[{i+1}/{len(AGGREGATORS)}] Testing {agg_name} (cost: {agg_config['cost']} units)")
+                
+                # Prepare params with specific aggregator
+                params = base_params.copy()
+                params["aggregators"] = agg_name
+                
+                print(f"Request parameters for {agg_name}:")
+                print(json.dumps(params, indent=2))
+                
+                # Make request
+                print(f"Sending request to {agg_name}...")
+                response = APIRetry.get(url, params=params, headers=headers)
+                response.raise_for_status()
+                data = response.json()
+                
+                # Track computing units used
+                self.computing_units_used += agg_config["cost"]
+                print(f"[Rate Limit] Used {agg_config['cost']} units for {agg_name} (total: {self.computing_units_used}/100)")
+                
+                if 'data' in data and 'amountOut' in data['data']:
+                    amount_out = int(data['data']['amountOut'])
+                    price_impact = float(data['data'].get('priceImpact', 0))
+                    
+                    # Calculate rate for comparison
+                    amount_decimal = Decimal(base_params['amountIn']) / Decimal(10**18)
+                    usdc_decimal = Decimal(amount_out) / Decimal(10**6)
+                    rate = usdc_decimal / amount_decimal if amount_decimal else Decimal('0')
+                    
+                    aggregator_results[agg_name] = {
+                        "amount_out": amount_out,
+                        "price_impact": price_impact,
+                        "rate": float(rate),
+                        "success": True
+                    }
+                    
+                    print(f"✓ {agg_name} successful:")
+                    print(f"  - USDC amount: {usdc_decimal}")
+                    print(f"  - Rate: {float(rate):.6f} USDC/LP")
+                    print(f"  - Price impact: {price_impact:.4f}%")
+                    
+                    # Check if this is the best result (highest USDC amount)
+                    if amount_out > best_amount:
+                        best_amount = amount_out
+                        best_price_impact = price_impact
+                        best_result = {
+                            "amount": amount_out,
+                            "price_impact": price_impact,
+                            "method": f"Direct ({agg_name})",
+                            "aggregator": agg_name,
+                            "rate": float(rate)
+                        }
+                    
+                else:
+                    print(f"✗ {agg_name} invalid response: {data}")
+                    aggregator_results[agg_name] = {
+                        "error": "Invalid response format",
+                        "success": False
+                    }
+                
+            except Exception as e:
+                print(f"✗ {agg_name} failed: {str(e)}")
+                aggregator_results[agg_name] = {
+                    "error": str(e),
+                    "success": False
+                }
+                
+                # Still track computing units even on failure
+                self.computing_units_used += agg_config["cost"]
+            
+            # Add delay between aggregator calls (except for the last one)
+            if i < len(AGGREGATORS) - 1:
+                delay = RATE_LIMIT_CONFIG["delay_between_aggregators"]
+                print(f"[Rate Limit] Waiting {delay}s before next aggregator...")
+                time.sleep(delay)
+        
+        # Update last quote time
+        self.last_quote_time = time.time()
+        
+        # Display comparison results
+        print(f"\n[Multi-Aggregator] Comparison Results:")
+        print("-" * 60)
+        successful_results = [(name, result) for name, result in aggregator_results.items() if result.get("success")]
+        
+        if successful_results:
+            # Sort by USDC amount (best first)
+            successful_results.sort(key=lambda x: x[1]["amount_out"], reverse=True)
+            
+            for i, (name, result) in enumerate(successful_results):
+                symbol = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "  "
+                amount_out = result["amount_out"]
+                rate = result["rate"]
+                price_impact = result["price_impact"]
+                print(f"{symbol} {name}: {amount_out/1e6:.6f} USDC (rate: {rate:.6f}, impact: {price_impact:.4f}%)")
+        
+        failed_results = [(name, result) for name, result in aggregator_results.items() if not result.get("success")]
+        if failed_results:
+            print("\nFailed aggregators:")
+            for name, result in failed_results:
+                print(f"❌ {name}: {result.get('error', 'Unknown error')}")
+        
+        if best_result:
+            print(f"\n🏆 Best result: {best_result['aggregator']} with {best_amount/1e6:.6f} USDC")
+            return best_amount, best_price_impact, best_result["method"], best_result
+        else:
+            raise Exception("All aggregators failed to provide quotes")
 
     def get_pool_info(self, network, pool_id):
         """
@@ -335,35 +517,30 @@ class BalanceManager:
         print(f"Headers: {json.dumps(headers, indent=2)}")
         print(f"Params: {json.dumps(params, indent=2)}")
         
-        # Try direct method first (skip for yvBal-GHO-USR)
+        # Try multi-aggregator direct method first (skip for yvBal-GHO-USR)
         print("\n" + "="*80)
-        print("METHOD 1: DIRECT CONVERSION")
+        print("METHOD 1: MULTI-AGGREGATOR DIRECT CONVERSION")
         print("="*80)
         
         direct_result = None
         if pool['config']['market_address'].lower() != '0x69efa3cd7fc773fe227b9cc4f41132dcde020a29000000000000000000000000':
             try:
-                response = requests.get(url, params=params, headers=headers)
-                response.raise_for_status()
-                data = response.json()
+                amount_out, price_impact, method_used, best_result = self._get_multiple_aggregator_quotes(url, params)
                 
-                amount_out = int(data["data"]["amountOut"])
-                price_impact = float(data["data"]["priceImpact"])
-                
-                print("\n✓ Direct conversion successful")
+                print("\n✓ Multi-aggregator conversion successful")
                 print(f"Input: {Decimal(balance_str)/Decimal(10**18)} LP")
                 print(f"Output: {Decimal(amount_out)/Decimal(10**6)} USDC")
                 print(f"Price impact: {price_impact:.4f}%")
+                print(f"Best aggregator: {best_result['aggregator']}")
                 
                 direct_result = {
                     "amount": amount_out,
                     "price_impact": price_impact,
-                    "method": "direct"
+                    "method": method_used,
+                    "aggregator": best_result['aggregator']
                 }
             except Exception as e:
-                print(f"\n✗ Direct conversion failed: {str(e)}")
-                print(f"Response status: {response.status_code}")
-                print(f"Response body: {response.text}")
+                print(f"\n✗ Multi-aggregator conversion failed: {str(e)}")
         else:
             print("\nSkipping direct conversion for yvBal-GHO-USR (using Yearn Vault method only)")
         
@@ -1122,7 +1299,14 @@ class BalanceManager:
                     
                     # Store method details
                     is_fallback = used_method == "Fallback"
-                    method_note = "Direct conversion via Pendle SDK" if used_method == "Direct" else "LP -> PT/SY -> USDC conversion path"
+                    method_note = f"Multi-aggregator conversion via Pendle SDK" if "Direct" in used_method else "LP -> PT/SY -> USDC conversion path"
+                    
+                    # Extract aggregator info if available
+                    aggregator_used = None
+                    if direct_result and "aggregator" in direct_result:
+                        aggregator_used = direct_result["aggregator"]
+                    elif fallback_result and "aggregator" in fallback_result:
+                        aggregator_used = fallback_result["aggregator"]
                     
                     # Calculate rewards value in USDC
                     rewards_total = 0
@@ -1149,6 +1333,21 @@ class BalanceManager:
                     position_total = usdc_amount + rewards_total
                     network_total += position_total
                     
+                    # Create conversion details with aggregator info
+                    conversion_details = {
+                        "source": "Pendle SDK (Multi-Aggregator)",
+                        "price_impact": f"{price_impact:.6f}",
+                        "rate": f"{Decimal(usdc_amount)/Decimal(balance)*Decimal(10**12):.6f}",
+                        "fee_percentage": "0.0000%",
+                        "fallback": is_fallback,
+                        "note": f"Using {used_method} method: {method_note}"
+                    }
+                    
+                    # Add aggregator info if available
+                    if aggregator_used:
+                        conversion_details["aggregator"] = aggregator_used
+                        conversion_details["note"] += f" (Best: {aggregator_used})"
+                    
                     # Add position data to result
                     position_data = {
                         "staking_contract": pool['pool_info']['rewardPool'],
@@ -1158,14 +1357,7 @@ class BalanceManager:
                             "USDC": {
                                 "amount": usdc_amount,
                                 "decimals": 6,
-                                "conversion_details": {
-                                    "source": "Pendle SDK",
-                                    "price_impact": f"{price_impact:.6f}",
-                                    "rate": f"{Decimal(usdc_amount)/Decimal(balance)*Decimal(10**12):.6f}",
-                                    "fee_percentage": "0.0000%",
-                                    "fallback": is_fallback,
-                                    "note": f"Using {used_method} method: {method_note}"
-                                }
+                                "conversion_details": conversion_details
                             }
                         },
                         "rewards": rewards_data,
